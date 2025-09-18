@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Grid Royale</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0b0b0b">
+<style>
+  html, body { margin:0; padding:0; background:#0b0b0b; height:100%; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; background:#121212; touch-action:manipulation; }
+  * { -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script type="module">
+/*
+Grid Royale — Responsive Single-file Build
+
+Features:
+- Branding everywhere (start/win/lose), monospace font, sizes in em
+- Larger bold "buttons" (canvas text) for Start and Return
+- Portrait (900x1600, right rail cards) and Landscape (1600x900, bottom bar)
+- Start → Play → Win/Lose flow with ad placeholders on end screens
+- $ economy from intact buildings (type multipliers)
+- 8-card deck; enemy roster auto-syncs to Deck.cards
+- Touch-first input, mouse fallback
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+
+// Logical world sizes for each orientation
+const LAND_W = 1600, LAND_H = 900;
+const PORT_W = 900,  PORT_H = 1600;
+
+let WORLD_W = LAND_W, WORLD_H = LAND_H;
+let UI_RATIO = 0.26; // landscape bottom bar height factor
+let UI_H = Math.floor(LAND_H * UI_RATIO); // landscape: bottom bar height
+let UI_W = 0; // portrait: right rail width
+
+const DPI = () => window.devicePixelRatio || 1;
+let viewScale = 1, viewOffsetX = 0, viewOffsetY = 0;
+let gameState = 'start'; // 'start' | 'play' | 'win' | 'lose'
+
+// Orientation helpers
+function isPortrait(){
+  // Prefer media query when available, fallback to aspect
+  if (window.matchMedia && window.matchMedia("(orientation: portrait)").matches) return true;
+  if (window.matchMedia && window.matchMedia("(orientation: landscape)").matches) return false;
+  return window.innerHeight > window.innerWidth;
+}
+
+function resizeCanvas(){
+  const dpr = DPI();
+  canvas.width = Math.floor(window.innerWidth * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  if (isPortrait()){
+    WORLD_W = PORT_W; WORLD_H = PORT_H;
+    UI_W = Math.floor(WORLD_W * 0.28);
+    UI_H = 0;
+  } else {
+    WORLD_W = LAND_W; WORLD_H = LAND_H;
+    UI_H = Math.floor(WORLD_H * UI_RATIO);
+    UI_W = 0;
+  }
+
+  const cssW = canvas.width / dpr, cssH = canvas.height / dpr;
+  viewScale = Math.min(cssW / WORLD_W, cssH / WORLD_H);
+  viewOffsetX = (cssW - WORLD_W * viewScale) / 2;
+  viewOffsetY = (cssH - WORLD_H * viewScale) / 2;
+
+  UI.compute();
+}
+window.addEventListener('resize', resizeCanvas);
+
+// World transforms
+function applyWorld(){ ctx.save(); ctx.translate(viewOffsetX, viewOffsetY); ctx.scale(viewScale, viewScale); }
+function restoreWorld(){ ctx.restore(); }
+
+// Screen -> World coords
+function screenToWorld(clientX, clientY){
+  const rect = canvas.getBoundingClientRect();
+  const px = (clientX - rect.left) * (canvas.width / rect.width);
+  const py = (clientY - rect.top)  * (canvas.height / rect.height);
+  const dpr = DPI();
+  const cx = px / dpr, cy = py / dpr;
+  return { x: (cx - viewOffsetX) / viewScale, y: (cy - viewOffsetY) / viewScale };
+}
+
+// Utils
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const dist = (a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const rnd = (a,b)=>Math.random()*(b-a)+a;
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); }
+function fillRR(x,y,w,h,r){ rr(x,y,w,h,r); ctx.fill(); }
+function strokeRR(x,y,w,h,r){ rr(x,y,w,h,r); ctx.stroke(); }
+function drawHP(x,y,w,h,pct,color){ const r = Math.min(6, h/2); ctx.fillStyle='rgba(0,0,0,0.55)'; fillRR(x,y,w,h,r); ctx.fillStyle=color; fillRR(x,y,Math.max(0,w*pct),h,r); }
+function drawStar(cx, cy, spikes, outerR, innerR, color){
+  let rot = Math.PI/2*3, x=cx, y=cy; const step = Math.PI / spikes;
+  ctx.beginPath(); ctx.moveTo(cx, cy-outerR);
+  for (let i=0;i<spikes;i++){
+    x = cx + Math.cos(rot)*outerR; y = cy + Math.sin(rot)*outerR; ctx.lineTo(x,y); rot += step;
+    x = cx + Math.cos(rot)*innerR; y = cy + Math.sin(rot)*innerR; ctx.lineTo(x,y); rot += step;
+  }
+  ctx.lineTo(cx, cy-outerR); ctx.closePath(); ctx.fillStyle = color; ctx.fill();
+}
+
+// Arena
+function drawArena(){
+  const g = ctx.createLinearGradient(0,0,0,WORLD_H);
+  g.addColorStop(0,'#0f0f11'); g.addColorStop(1,'#171a1f');
+  ctx.fillStyle = g; ctx.fillRect(0,0,WORLD_W,WORLD_H);
+
+  // Subtle grid excluding UI space
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.035)'; ctx.lineWidth = 1;
+  const gridYMax = isPortrait() ? WORLD_H : (WORLD_H - UI_H);
+  const gridXMax = isPortrait() ? (WORLD_W - UI_W) : WORLD_W;
+  for(let y=0; y<gridYMax; y+=40){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(gridXMax,y); ctx.stroke(); }
+  for(let x=0; x<gridXMax; x+=40){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,gridYMax); ctx.stroke(); }
+  ctx.restore();
+}
+
+// Buildings
+const BUILDING_TYPES = [
+  { id:'residential', color:'#8ecae6', hp:360, income:1.00 },
+  { id:'business',    color:'#ffb703', hp:420, income:1.35 },
+  { id:'industrial',  color:'#fb8500', hp:480, income:1.15 },
+  { id:'civic',       color:'#90be6d', hp:520, income:0.80 }
+];
+
+const City = {
+  make(owner, startX, startY, cols, rows, size){
+    const blocks=[];
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        const type = BUILDING_TYPES[(r*7 + c*11) % BUILDING_TYPES.length];
+        blocks.push({
+          owner, color: type.color, incomeMul: type.income,
+          x: startX + c*size, y: startY + r*size, w: size-4, h: size-4,
+          hp: type.hp, maxHp: type.hp, alive:true
+        });
+      }
+    }
+    return { owner, blocks, alive:true };
+  },
+  draw(city){
+    for(const b of city.blocks){
+      if(!b.alive) continue;
+      ctx.fillStyle = b.color; ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = '#00000033';
+      ctx.fillRect(b.x, b.y+b.h-6, b.w, 6);
+      ctx.fillRect(b.x+b.w-6, b.y, 6, b.h);
+      // Damage tint
+      if (b.hp < b.maxHp){
+        const pct = 1 - (b.hp / b.maxHp);
+        ctx.fillStyle = `rgba(255,80,80,${0.12 + 0.28*pct})`;
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+      }
+    }
+  },
+  nearestBlock(city, from){
+    let best=null, bd=Infinity;
+    for(const b of city.blocks){
+      if(!b.alive) continue;
+      const bx = b.x + b.w/2, by = b.y + b.h/2;
+      const d = Math.hypot(bx - from.x, by - from.y);
+      if (d<bd){ bd=d; best=b; }
+    }
+    return best;
+  },
+  updateAlive(city){ city.alive = city.blocks.some(b=>b.alive); },
+  totalIncomeMul(city){ let sum=0; for(const b of city.blocks) if(b.alive) sum+=b.incomeMul; return sum; }
+};
+
+// Units
+const Unit = {
+  STATS: {
+    human_revolver:{ hp:420, dps:55,  speed:92,  r:11, range:120, color:'#b3c7ff' },
+    human_ar:      { hp:520, dps:75,  speed:90,  r:11, range:140, color:'#9ec9ff' },
+    dog:           { hp:240, dps:65,  speed:140, r:9,  range:28,  color:'#ffd1a6' },
+    drone_bb:      { hp:260, dps:40,  speed:110, r:9,  range:180, color:'#c7ffd1' },
+    alien_laser:   { hp:560, dps:110, speed:95,  r:12, range:200, color:'#ff9bd1' },
+    robotdog_abg:  { hp:520, dps:85,  speed:130, r:10, range:40,  color:'#b5ffe1' },
+    robot_ar:      { hp:760, dps:85,  speed:85,  r:13, range:150, color:'#cfd4ff' },
+    clone_abg:     { hp:880, dps:120, speed:88,  r:13, range:160, color:'#ffe39e' }
+  },
+  costOf(id){ return Deck.cards.find(c=>c.id===id)?.cost ?? 3; },
+  make(owner, id, x, y){
+    const s = Unit.STATS[id];
+    return {
+      owner, type:id, x, y,
+      hp:s.hp, maxHp:s.hp, dps:s.dps, speed:s.speed, r:s.r, range:s.range, color:s.color,
+      alive:true, target:null,
+      update(dt, scene){
+        if (!this.alive) return;
+
+        if (!this.target || !this.target.alive){
+          const enemies = scene.units.filter(u=>u.alive && u.owner!==this.owner);
+          let best=null, bd=Infinity;
+          for(const u of enemies){ const d = dist(this,u); if (d<bd){ bd=d; best=u; } }
+          if (!best){
+            const enemyCity = (this.owner==='player') ? scene.enemyCity : scene.playerCity;
+            best = City.nearestBlock(enemyCity, this);
+          }
+          this.target = best;
+        }
+
+        if (this.target){
+          const tx = this.target.x + (this.target.w?this.target.w/2:0);
+          const ty = this.target.y + (this.target.h?this.target.h/2:0);
+          const d = Math.hypot(tx - this.x, ty - this.y);
+          if (d <= this.range + (this.target.r||0)){
+            this.target.hp -= this.dps * dt;
+            if (this.target.hp <= 0){ this.target.hp=0; this.target.alive=false; }
+          } else {
+            const dx = tx - this.x, dy = ty - this.y;
+            const m = Math.hypot(dx,dy)||1;
+            this.x += (dx/m) * this.speed * dt;
+            this.y += (dy/m) * this.speed * dt;
+          }
+        }
+
+        if (this.hp <= 0) this.alive = false;
+      },
+      draw(){
+        ctx.save();
+        ctx.shadowColor = this.owner==='player' ? '#60a5fa' : '#fb7185';
+        ctx.shadowBlur = 8;
+        ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, Math.PI*2);
+        ctx.fillStyle = this.color; ctx.fill();
+        ctx.restore();
+        drawHP(this.x-18, this.y-this.r-10, 36, 5, this.hp/this.maxHp, this.owner==='player'?'#60a5fa':'#fb7185');
+      }
+    };
+  }
+};
+
+// Deck & Economy
+const Deck = {
+  cards: [
+    { id:'human_revolver', name:'Human (Revolver)', cost:3 },
+    { id:'human_ar',       name:'Human (AR)',       cost:4 },
+    { id:'dog',            name:'Dog',              cost:2 },
+    { id:'drone_bb',       name:'Drone (BB)',       cost:3 },
+    { id:'alien_laser',    name:'Alien (Laser)',    cost:5 },
+    { id:'robotdog_abg',   name:'Robot Dog (ABG)',  cost:4 },
+    { id:'robot_ar',       name:'Robot (AR)',       cost:5 },
+    { id:'clone_abg',      name:'Clone (ABG)',      cost:6 }
+  ],
+  selected: null
+};
+
+const Economy = {
+  money: 6, enemyMoney: 6,
+  basePerBuilding: 0.15, // $/sec * sum of income multipliers of intact buildings
+  update(dt, scene){
+    const pMul = City.totalIncomeMul(scene.playerCity);
+    const eMul = City.totalIncomeMul(scene.enemyCity);
+    this.money += this.basePerBuilding * pMul * dt;
+    this.enemyMoney += this.basePerBuilding * eMul * dt;
+    this.money = Math.max(0, this.money);
+    this.enemyMoney = Math.max(0, this.enemyMoney);
+  }
+};
+
+// Scene & AI
+const Scene = {
+  units: [],
+  playerCity: null,
+  enemyCity: null,
+  starsP: 0, starsE: 0,
+  time: 0,
+  ended: false,
+  breakdown: {
+    destroyedCountP: 0, totalBlocksE: 0, baseScoreP: 0, timeBonusP: 0,
+    destroyedCountE: 0, totalBlocksP: 0, baseScoreE: 0, timeBonusE: 0
+  },
+
+  reset(){
+    this.units.length = 0;
+
+    const cols = 8, rows = 3;
+    const tile = 44;
+    const startX = Math.floor((WORLD_W - (cols*tile)) / 2);
+
+    // Enemy at top, Player at bottom (works for both orientations)
+    this.enemyCity  = City.make('enemy',  startX, Math.floor(0.10*WORLD_H), cols, rows, tile);
+    this.playerCity = City.make('player', startX, Math.floor(0.64*WORLD_H), cols, rows, tile);
+
+    this.starsP = 0; this.starsE = 0; this.time = 0; this.ended = false;
+    this.breakdown = { destroyedCountP:0,totalBlocksE:0,baseScoreP:0,timeBonusP:0,
+                       destroyedCountE:0,totalBlocksP:0,baseScoreE:0,timeBonusE:0 };
+    Deck.selected = null;
+    Economy.money = 6; Economy.enemyMoney = 6;
+  },
+
+  update(dt){
+    if (this.ended) return;
+    this.time += dt;
+    Economy.update(dt, this);
+    AI.update(dt, this);
+
+    for (const u of this.units) if (u.alive) u.update(dt, this);
+    for (let i=this.units.length-1;i>=0;i--) if (!this.units[i].alive) this.units.splice(i,1);
+
+    City.updateAlive(this.playerCity);
+    City.updateAlive(this.enemyCity);
+
+    // Scoring
+    const destroyedCountP = this.enemyCity.blocks.filter(b=>!b.alive).length;
+    const destroyedCountE = this.playerCity.blocks.filter(b=>!b.alive).length;
+    const totalBlocksE = this.enemyCity.blocks.length;
+    const totalBlocksP = this.playerCity.blocks.length;
+    const maxTime = 180;
+    const timeFactor = Math.max(0, (maxTime - this.time) / maxTime);
+    const baseScoreP = destroyedCountP * 10;
+    const baseScoreE = destroyedCountE * 10;
+    const timeBonusP = Math.floor(timeFactor * 50);
+    const timeBonusE = Math.floor(timeFactor * 50);
+    this.starsP = baseScoreP + timeBonusP;
+    this.starsE = baseScoreE + timeBonusE;
+
+    // Breakdown for end screens
+    this.breakdown.destroyedCountP = destroyedCountP;
+    this.breakdown.totalBlocksE = totalBlocksE;
+    this.breakdown.baseScoreP = baseScoreP;
+    this.breakdown.timeBonusP = timeBonusP;
+    this.breakdown.destroyedCountE = destroyedCountE;
+    this.breakdown.totalBlocksP = totalBlocksP;
+    this.breakdown.baseScoreE = baseScoreE;
+    this.breakdown.timeBonusE = timeBonusE;
+
+    // End condition
+    if (!this.playerCity.alive || !this.enemyCity.alive){
+      this.ended = true;
+      if (!this.playerCity.alive) gameState = 'lose';
+      else gameState = 'win';
+    }
+  }
+};
+
+const AI = {
+  t:0,
+  update(dt, sc){
+    this.t += dt;
+    if (this.t > 1.5){
+      this.t = 0;
+      const roster = Deck.cards.map(c => c.id); // synced to player deck
+      let deploys = 2;
+      while (deploys-- > 0){
+        const pick = roster[Math.floor(Math.random()*roster.length)];
+        const cost = Unit.costOf(pick);
+        if (Economy.enemyMoney >= cost){
+          Economy.enemyMoney -= cost;
+          const exMax = isPortrait() ? (WORLD_W - UI_W - 100) : (WORLD_W - 100);
+          const ex = rnd(100, exMax);
+          const ey = rnd(80, WORLD_H/2 - 80);
+          sc.units.push(Unit.make('enemy', pick, ex, ey));
+        }
+      }
+    }
+  }
+};
+
+// UI layout and drawing
+const UI = {
+  cards: [],
+  portrait: false,
+  compute(){
+    this.portrait = isPortrait();
+    this.cards = [];
+
+    if (this.portrait){
+      // Vertical stack on right rail
+      const CC = Deck.cards.length;
+      const railX = WORLD_W - UI_W;
+      const pad = 12;
+      const cardW = UI_W - pad*2;
+      const headerH = 54;
+      const gap = 10;
+      const workableH = WORLD_H - (pad*2 + headerH);
+      const cardH = Math.max(90, Math.floor((workableH - (CC-1)*gap) / CC));
+      let y = pad + headerH;
+      for (let i=0;i<CC;i++){
+        this.cards.push({ x: railX + pad, y, w: cardW, h: cardH, id: Deck.cards[i].id });
+        y += cardH + gap;
+      }
+    } else {
+      // Horizontal bar at bottom
+      const CC = Deck.cards.length;
+      const cardW = Math.floor(WORLD_W / Math.max(8, CC + 2));
+      const cardH = Math.floor(UI_H * 0.58);
+      const gap = Math.floor(cardW * 0.10);
+      const totalW = CC*cardW + (CC-1)*gap;
+      let cx = Math.floor((WORLD_W - totalW)/2);
+      const cy = Math.floor(WORLD_H - cardH - 18);
+      for (let i=0;i<CC;i++){
+        this.cards.push({ x:cx, y:cy, w:cardW, h:cardH, id:Deck.cards[i].id });
+        cx += cardW + gap;
+      }
+    }
+  }
+};
+
+function drawUI(){
+  if (UI.portrait){
+    const railX = WORLD_W - UI_W;
+    ctx.fillStyle = 'rgba(0,0,0,0.78)';
+    ctx.fillRect(railX, 0, UI_W, WORLD_H);
+
+    // Money header
+    ctx.fillStyle = '#e8eef7'; ctx.textAlign='left'; ctx.font='bold 1.1em monospace';
+    ctx.fillText(`$ ${Math.floor(Economy.money)}`, railX + 12, 28);
+
+    // Score pill (top-left in playfield)
+    const pillW = 300, pillH = 28, pad = 10, hudY = 10;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; fillRR(pad, hudY, pillW, pillH, 10);
+    drawStar(pad+16, hudY+14, 5, 9, 4, '#ffd54f');
+    ctx.fillStyle = '#e8eef7'; ctx.textAlign='left'; ctx.font='bold 1em monospace';
+    ctx.fillText(`Score: ${Scene.starsP} — ${Scene.starsE}`, pad+30, hudY+19);
+
+    // Timer (top-center of playfield)
+    const timePillW = 160;
+    const playW = WORLD_W - UI_W;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; fillRR(playW/2 - timePillW/2, hudY, timePillW, pillH, 10);
+    ctx.fillStyle = '#e8eef7'; ctx.textAlign='center'; ctx.font='bold 1em monospace';
+    ctx.fillText(fmtTime(Scene.time), playW/2, hudY+19);
+
+    // Cards
+    for (let i=0;i<Deck.cards.length;i++){
+      const c = Deck.cards[i];
+      const r = UI.cards[i];
+      const can = Economy.money >= c.cost;
+      const sel = Deck.selected && Deck.selected.id===c.id;
+
+      const face = ctx.createLinearGradient(r.x, r.y, r.x, r.y+r.h);
+      face.addColorStop(0, '#1d2330'); face.addColorStop(1, '#121720');
+      ctx.fillStyle = face; fillRR(r.x, r.y, r.w, r.h, 12);
+      ctx.strokeStyle = sel ? '#7c4dff' : '#334155';
+      ctx.lineWidth = sel ? 3 : 1; strokeRR(r.x, r.y, r.w, r.h, 12);
+      if (!can){ ctx.fillStyle='rgba(0,0,0,0.35)'; fillRR(r.x, r.y, r.w, r.h, 12); }
+
+      ctx.fillStyle = '#e8eef7'; ctx.textAlign='center'; ctx.font='bold 2em monospace';
+      ctx.fillText(c.name, r.x + r.w/2, r.y + r.h*0.42);
+      ctx.fillStyle = '#bcd'; ctx.font='1em monospace';
+      ctx.fillText(`$${c.cost}`, r.x + r.w/2, r.y + r.h*0.72);
+    }
+  } else {
+    // Bottom bar
+    ctx.fillStyle = 'rgba(0,0,0,0.78)';
+    ctx.fillRect(0, WORLD_H - UI_H, WORLD_W, UI_H);
+
+    // Money
+    ctx.fillStyle = '#e8eef7'; ctx.textAlign='left'; ctx.font='bold 1.1em monospace';
+    ctx.fillText(`$ ${Math.floor(Economy.money)}`, 14, WORLD_H - UI_H + 28);
+
+    // Cards
+    for (let i=0;i<Deck.cards.length;i++){
+      const c = Deck.cards[i];
+      const r = UI.cards[i];
+      const can = Economy.money >= c.cost;
+      const sel = Deck.selected && Deck.selected.id===c.id;
+
+      const face = ctx.createLinearGradient(r.x, r.y, r.x, r.y+r.h);
+      face.addColorStop(0, '#1d2330'); face.addColorStop(1, '#121720');
+      ctx.fillStyle = face; fillRR(r.x, r.y, r.w, r.h, 12);
+      ctx.strokeStyle = sel ? '#7c4dff' : '#334155';
+      ctx.lineWidth = sel ? 3 : 1; strokeRR(r.x, r.y, r.w, r.h, 12);
+      if (!can){ ctx.fillStyle='rgba(0,0,0,0.35)'; fillRR(r.x, r.y, r.w, r.h, 12); }
+
+      ctx.fillStyle = '#e8eef7'; ctx.textAlign='center'; ctx.font='bold 1em monospace';
+      ctx.fillText(c.name, r.x + r.w/2, r.y + r.h*0.38);
+      ctx.fillStyle = '#bcd'; ctx.font='1em monospace';
+      ctx.fillText(`$${c.cost}`, r.x + r.w/2, r.y + r.h*0.68);
+    }
+
+    // HUD top
+    const pillW = 300, pillH = 28, pad = 10, hudY = 10;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; fillRR(pad, hudY, pillW, pillH, 10);
+    drawStar(pad+16, hudY+14, 5, 9, 4, '#ffd54f');
+    ctx.fillStyle = '#e8eef7'; ctx.textAlign='left'; ctx.font='bold 1em monospace';
+    ctx.fillText(`Score: ${Scene.starsP} — ${Scene.starsE}`, pad+30, hudY+19);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; fillRR(WORLD_W - pillW - pad, hudY, pillW, pillH, 10);
+    ctx.fillStyle = '#e8eef7'; ctx.textAlign='center'; ctx.font='bold 1em monospace';
+    ctx.fillText(fmtTime(Scene.time), WORLD_W - pillW/2 - pad, hudY+19);
+  }
+}
+
+function fmtTime(t){
+  const s = Math.floor(t);
+  const mm = String(Math.floor(s/60)).padStart(2,'0');
+  const ss = String(s%60).padStart(2,'0');
+  return `${mm}:${ss}`;
+}
+
+// Pages (screen space, monospace branding)
+function drawStartPage(){
+  ctx.save();
+  ctx.setTransform(1,0,0,1,0,0);
+  const dpr = DPI(); const w = canvas.width/dpr, h = canvas.height/dpr;
+
+  const g = ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0,'#0b0b11'); g.addColorStop(1,'#11161e');
+  ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+
+  // Game title with glow
+  ctx.save();
+  ctx.textAlign='center';
+  ctx.shadowColor = '#7c4dff';
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = '#e6edf6';
+  ctx.font = 'bold 3em monospace';
+  ctx.fillText('GRID ROYALE', w/2, h*0.28);
+  ctx.restore();
+
+  // Tagline
+  ctx.fillStyle = '#b6c2cf';
+  ctx.textAlign='center';
+  ctx.font = '1.25em monospace';
+  ctx.fillText('Command. Conquer. Outlast.', w/2, h*0.28 + 40);
+
+  // Start "button"
+  const bw = 280, bh = 70, bx = w/2 - bw/2, by = h*0.55;
+  ctx.fillStyle = '#7c4dff'; fillRR(bx, by, bw, bh, 14);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 2em monospace';
+  ctx.textAlign='center';
+  ctx.fillText('Tap to Start', w/2, by + bh*0.66);
+
+  // Instructions
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '1em monospace';
+  ctx.fillText('Tap a card, then tap your half (bottom) to deploy.', w/2, h - 40);
+  ctx.restore();
+}
+
+function drawLosePage(){
+  drawEndPage('YOU LOSE', '#ef4444', Scene.breakdown, Scene.starsP, Scene.time);
+}
+function drawWinPage(){
+  drawEndPage('YOU WIN!', '#22c55e', Scene.breakdown, Scene.starsP, Scene.time);
+}
+function drawEndPage(title, titleColor, d, finalScore, timeVal){
+  ctx.save();
+  ctx.setTransform(1,0,0,1,0,0);
+  const dpr = DPI(); const w = canvas.width/dpr, h = canvas.height/dpr;
+
+  ctx.fillStyle = '#0b0b0b'; ctx.fillRect(0,0,w,h);
+
+  // Game title
+  ctx.fillStyle = '#e6edf6'; ctx.textAlign='center';
+  ctx.font = 'bold 2em monospace';
+  ctx.fillText('GRID ROYALE', w/2, 56);
+
+  // Result title
+  ctx.fillStyle = titleColor;
+  ctx.font = 'bold 2.5em monospace';
+  ctx.fillText(title, w/2, h*0.26);
+
+  // Breakdown
+  const lines = [
+    `Buildings Destroyed: ${d.destroyedCountP} / ${d.totalBlocksE}`,
+    `Time Taken: ${fmtTime(timeVal)}`,
+    `Base Score: ${d.baseScoreP}`,
+    `Time Bonus: +${d.timeBonusP}`,
+    `Final Score: ${finalScore}`
+  ];
+  ctx.fillStyle = '#e5e7eb';
+  ctx.font = '1.2em monospace';
+  let y = h*0.26 + 48;
+  for (const line of lines){ ctx.fillText(line, w/2, y); y += 28; }
+
+  // Ad placeholder
+  const adW = Math.min(360, Math.floor(w*0.8)), adH = 150, adX = w/2 - adW/2, adY = y + 12;
+  ctx.fillStyle = '#1f2937'; fillRR(adX, adY, adW, adH, 10);
+  ctx.strokeStyle = '#374151'; ctx.lineWidth = 2; strokeRR(adX, adY, adW, adH, 10);
+  ctx.fillStyle = '#e5e7eb'; ctx.font = 'bold 1.6em monospace';
+  ctx.fillText('Ad Space', w/2, adY + adH/2 + 8);
+
+  // Return hint
+  ctx.fillStyle = '#cbd5e1'; ctx.font = 'bold 1.75em monospace';
+  ctx.fillText('Tap to return to Start', w/2, adY + adH + 48);
+  ctx.restore();
+}
+
+// Input handlers
+function handlePointer(clientX, clientY){
+  if (gameState === 'start'){
+    gameState = 'play';
+    Scene.reset();
+    return;
+  }
+  if (gameState === 'lose' || gameState === 'win'){
+    gameState = 'start';
+    return;
+  }
+  if (gameState !== 'play') return;
+
+  const p = screenToWorld(clientX, clientY);
+
+  // UI hit-test
+  if (UI.portrait){
+    const railX = WORLD_W - UI_W;
+    if (p.x >= railX){
+      for (let i=0;i<UI.cards.length;i++){
+        const r = UI.cards[i];
+        if (p.x>=r.x && p.x<=r.x+r.w && p.y>=r.y && p.y<=r.y+r.h){
+          const card = Deck.cards[i];
+          if (Economy.money >= card.cost) Deck.selected = card;
+          return;
+        }
+      }
+      return;
+    }
+  } else {
+    if (p.y >= WORLD_H - UI_H){
+      for (let i=0;i<UI.cards.length;i++){
+        const r = UI.cards[i];
+        if (p.x>=r.x && p.x<=r.x+r.w && p.y>=r.y && p.y<=r.y+r.h){
+          const card = Deck.cards[i];
+          if (Economy.money >= card.cost) Deck.selected = card;
+          return;
+        }
+      }
+      return;
+    }
+  }
+
+  // Map deploy (player half only)
+  if (!Deck.selected) return;
+  if (p.y < WORLD_H/2) return;
+  const cost = Deck.selected.cost;
+  if (Economy.money >= cost){
+    Economy.money -= cost;
+    const maxX = UI.portrait ? (WORLD_W - UI_W - 20) : (WORLD_W - 40);
+    const spawnX = clamp(p.x, 40, maxX);
+    const spawnY = clamp(p.y, WORLD_H/2 + 20, WORLD_H - 40);
+    Scene.units.push(Unit.make('player', Deck.selected.id, spawnX, spawnY));
+    Deck.selected = null;
+  }
+}
+
+canvas.addEventListener('touchstart', (e)=>{ const t = e.changedTouches[0]; handlePointer(t.clientX, t.clientY); }, { passive: true });
+canvas.addEventListener('click', (e)=> handlePointer(e.clientX, e.clientY));
+
+// Main loop
+let last = performance.now();
+function tick(ts){
+  const dt = Math.min(0.033, (ts-last)/1000);
+  last = ts;
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if (gameState === 'start'){
+    drawStartPage();
+  } else if (gameState === 'play'){
+    Scene.update(dt);
+
+    applyWorld();
+    drawArena();
+    City.draw(Scene.enemyCity);
+    City.draw(Scene.playerCity);
+
+    // Draw units (enemy first, player above)
+    for (const u of Scene.units.filter(u=>u.owner==='enemy')) u.draw();
+    for (const u of Scene.units.filter(u=>u.owner==='player')) u.draw();
+
+    drawUI();
+    restoreWorld();
+  } else if (gameState === 'lose'){
+    drawLosePage();
+  } else if (gameState === 'win'){
+    drawWinPage();
+  }
+
+  requestAnimationFrame(tick);
+}
+
+// Boot
+resizeCanvas();
+Scene.reset(); // prepare scene; Start Page waits for tap
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
